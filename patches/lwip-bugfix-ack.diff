@@ -1,0 +1,188 @@
+Index: lwip/src/core/tcp_in.c
+===================================================================
+--- lwip/src/core/tcp_in.c	(revision 394)
++++ lwip/src/core/tcp_in.c	(working copy)
+@@ -61,6 +61,7 @@
+ #include "lwip/stats.h"
+ 
+ #include "arch/perf.h"
++#include <kos/mutex.h>
+ #if LWIP_TCP
+ /* These variables are global to all functions involved in the input
+    processing of TCP segments. They are set by the tcp_input()
+@@ -85,6 +86,7 @@
+ static err_t tcp_listen_input(struct tcp_pcb_listen *pcb);
+ static err_t tcp_timewait_input(struct tcp_pcb *pcb);
+ 
++extern mutex_t *tcp_mutex;
+ /*-----------------------------------------------------------------------------------*/
+ /* tcp_input:
+  *
+@@ -267,7 +269,9 @@
+     recv_flags = 0;
+ 
+     tcp_input_pcb = pcb;
++    mutex_lock(tcp_mutex);
+     err = tcp_process(pcb);
++    mutex_unlock(tcp_mutex);
+     tcp_input_pcb = NULL;
+     /* A return value of ERR_ABRT means that tcp_abort() was called
+        and that the pcb has been freed. If so, we don't do anything. */
+Index: lwip/src/core/tcp_out.c
+===================================================================
+--- lwip/src/core/tcp_out.c	(revision 394)
++++ lwip/src/core/tcp_out.c	(working copy)
+@@ -57,31 +57,39 @@
+ #include "lwip/tcp.h"
+ 
+ #include "lwip/stats.h"
++#include <kos/mutex.h>
+ 
+ #if LWIP_TCP
+ 
+ /* Forward declarations.*/
+ static void tcp_output_segment(struct tcp_seg *seg, struct tcp_pcb *pcb);
++extern mutex_t *tcp_mutex;
+ 
+-
+ /*-----------------------------------------------------------------------------------*/
+ err_t
+ tcp_send_ctrl(struct tcp_pcb *pcb, u8_t flags)
+ {
+-  return tcp_enqueue(pcb, NULL, 0, flags, 1, NULL, 0);
+-
++  err_t err;
++  mutex_lock(tcp_mutex);
++  err = tcp_enqueue(pcb, NULL, 0, flags, 1, NULL, 0);
++  mutex_unlock(tcp_mutex);
++  return err;
+ }
+ /*-----------------------------------------------------------------------------------*/
+ err_t
+ tcp_write(struct tcp_pcb *pcb, const void *arg, u32_t len, u8_t copy)
+ {
++  err_t err;
+   DEBUGF(TCP_OUTPUT_DEBUG, ("tcp_write(pcb=%p, arg=%p, len=%lu, copy=%d)\n", (void *)pcb, arg, len, copy));
+   if (pcb->state == SYN_SENT ||
+      pcb->state == SYN_RCVD ||
+      pcb->state == ESTABLISHED ||
+      pcb->state == CLOSE_WAIT) {
+     if (len > 0) {
+-      return tcp_enqueue(pcb, (void *)arg, len, 0, copy, NULL, 0);
++      mutex_lock(tcp_mutex);
++      err = tcp_enqueue(pcb, (void *)arg, len, 0, copy, NULL, 0);
++      mutex_unlock(tcp_mutex);
++      return err;
+     }
+     return ERR_OK;
+   } else {
+@@ -96,11 +104,11 @@
+             u8_t *optdata, u8_t optlen)
+ {
+   struct pbuf *p;
+-  struct tcp_seg *seg, *useg, *queue;
++  struct tcp_seg *seg, *useg, *queue=NULL;
+   u32_t left, seqno;
+   u32_t seglen;
+   void *ptr;
+-  u8_t queuelen;
++  u32_t queuelen;
+ 
+   DEBUGF(TCP_OUTPUT_DEBUG, ("tcp_enqueue(pcb=%p, arg=%p, len=%lu, flags=%x, copy=%d)\n", (void *)pcb, arg, len, flags, copy));
+   left = len;
+Index: lwip/src/core/tcp.c
+===================================================================
+--- lwip/src/core/tcp.c	(revision 394)
++++ lwip/src/core/tcp.c	(working copy)
+@@ -53,6 +53,7 @@
+ #include "lwip/memp.h"
+ 
+ #include "lwip/tcp.h"
++#include <kos/mutex.h>
+ #if LWIP_TCP
+ 
+ /* Incremented every coarse grained timer shot
+@@ -73,7 +74,7 @@
+ static u8_t tcp_timer;
+ 
+ static u16_t tcp_new_port(void);
+-
++mutex_t *tcp_mutex;
+ /*-----------------------------------------------------------------------------------*/
+ /*
+  * tcp_init():
+@@ -90,6 +91,8 @@
+   tcp_tw_pcbs = NULL;
+   tcp_tmp_pcb = NULL;
+   
++  tcp_mutex = mutex_create();
++
+   /* initialize timer */
+   tcp_ticks = 0;
+   tcp_timer = 0;
+Index: kos/include/lwipopts.h
+===================================================================
+--- kos/include/lwipopts.h	(revision 394)
++++ kos/include/lwipopts.h	(working copy)
+@@ -127,14 +127,14 @@
+ #define TCP_MSS                 1476
+ 
+ /* TCP sender buffer space (bytes). */
+-#define TCP_SND_BUF             187452
++#define TCP_SND_BUF             192*TCP_MSS
+ 
+ /* TCP sender buffer space (pbufs). This must be at least = 2 *
+    TCP_SND_BUF/TCP_MSS for things to work. */
+ #define TCP_SND_QUEUELEN        2 * TCP_SND_BUF/TCP_MSS
+ 
+ /* TCP receive window. */
+-#define TCP_WND                 65535
++#define TCP_WND                 65335 
+ 
+ /* Maximum number of retransmissions of data segments. */
+ #define TCP_MAXRTX              12
+@@ -263,6 +263,7 @@
+ #define DHCP_DEBUG                      DBG_FLAG_COMMON
+ #define DBG_MIN_LEVEL                   DBG_LEVEL_WARNING
+ 
+-#define LWIP_DEBUG 1
++// kills performance because of memp_sanity()
++//#define LWIP_DEBUG 1
+ 
+ #endif /* __LWIPOPTS_H__ */
+Index: kos/sockets.c
+===================================================================
+--- kos/sockets.c	(revision 394)
++++ kos/sockets.c	(working copy)
+@@ -415,6 +415,17 @@
+ // This function is called by both lwip_close and the fs_close handler. It
+ // expects a socket #, not a VFS fd.
+ static int close_common(int s) {
++	int timeout = 0;
++
++	// nasty workaround for a socket being killed off before all data
++	// had been sent and also was causing lwip stack to crash.
++	// need to get unlazy and do a proper port of a newer lwip version
++	while(fds[s].send < TCP_SND_BUF && fds[s].send != -1 
++              && timeout < 1000) {
++		timeout++;
++		usleep(1000);
++	}
++
+ 	// Make sure we have access
+ 	mutex_lock(fds[s].mutex);
+ 
+@@ -1205,11 +1216,11 @@
+ 	errno = ENOSYS;
+ 	return -1;
+ }
+-
++/*
+ char * lwip_strerr(err_t err) {
+ 	return strerror(err);
+ }
+-
++*/
+ /////////////////////////////////////////////////////////////////////////////
+ // Administrative details
+ 

@@ -1,0 +1,238 @@
+diff -ur kos.orig/kernel/arch/dreamcast/fs/fs_iso9660.c kos/kernel/arch/dreamcast/fs/fs_iso9660.c
+--- kos.orig/kernel/arch/dreamcast/fs/fs_iso9660.c	2008-07-07 20:43:43.000000000 -0700
++++ kos/kernel/arch/dreamcast/fs/fs_iso9660.c	2008-07-07 21:49:32.000000000 -0700
+@@ -243,7 +243,7 @@
+ 	if (i >= NUM_CACHE_BLOCKS) { i = 0; }
+ 	
+ 	/* Load the requested block */
+-	j = cdrom_read_sectors(cache[i]->data, sector + 150, 1);
++	j = cdrom_read_sectors(READ_PIO, cache[i]->data, sector + 150, 1);
+ 	if (j < 0) {
+ 		//dbglog(DBG_ERROR, "fs_iso9660: can't read_sectors for %d: %d\n",
+ 		//	sector+150, j);
+@@ -306,7 +306,7 @@
+ 	iso_reset();
+ 	
+ 	/* Locate the root session */
+-	if ((i = cdrom_reinit()) != 0) {
++	if ((i = cdrom_reinit(-1, -1, -1)) != 0) {
+ 		dbglog(DBG_ERROR, "fs_iso9660:init_percd: cdrom_reinit returned %d\n", i);
+ 		return -1;
+ 	}
+@@ -637,7 +637,7 @@
+ 				thissect);
+ 
+ 			// Do the read
+-			if (cdrom_read_sectors(outbuf,
++			if (cdrom_read_sectors(READ_PIO, outbuf,
+ 				fh[fd].first_extent + fh[fd].ptr/2048 + 150,
+ 				thissect) < 0)
+ 			{
+diff -ur kos.orig/kernel/arch/dreamcast/hardware/cdrom.c kos/kernel/arch/dreamcast/hardware/cdrom.c
+--- kos.orig/kernel/arch/dreamcast/hardware/cdrom.c	2008-07-07 20:43:44.000000000 -0700
++++ kos/kernel/arch/dreamcast/hardware/cdrom.c	2008-07-07 22:01:06.000000000 -0700
+@@ -69,11 +69,9 @@
+ 
+ /* The CD access mutex */
+ static mutex_t * mutex = NULL;
+-static int sector_size = 2048;   /*default 2048, 2352 for raw data reading*/
+ 
+ void set_sector_size (int size) {
+-	sector_size = size;
+-	cdrom_reinit();
++	cdrom_reinit(-1, -1, size);
+ } 
+ 
+ /* Command execution sequence */
+@@ -141,9 +139,9 @@
+ }
+ 
+ /* Re-init the drive, e.g., after a disc change, etc */
+-int cdrom_reinit() {
++int cdrom_reinit(int param1, int cdxa, int sector_size) {
+ 	int	rv = ERR_OK;
+-	int	r = -1, cdxa;
++	int	r = -1;
+ 	uint32	params[4];
+ 	int	timeout;
+ 
+@@ -174,10 +172,16 @@
+ 
+ 	/* Check disc type and set parameters */
+ 	gdc_get_drv_stat(params);
+-	cdxa = params[1] == 32;
++	if(cdxa == -1) 
++		cdxa = (params[1] == 32 ? 2048 : 1024);
++	if(param1 == -1)
++		param1 = 8192;
++	if(sector_size == -1)
++	sector_size = 2048;
++ 
+ 	params[0] = 0;				/* 0 = set, 1 = get */
+-	params[1] = 8192;			/* ? */
+-	params[2] = cdxa ? 2048 : 1024;		/* CD-XA mode 1/2 */
++	params[1] = param1;			/* ? */
++	params[2] = cdxa;			/* CD-XA mode 1/2 */
+ 	params[3] = sector_size;		/* sector size */
+ 	if (gdc_change_data_type(params) < 0) { rv = ERR_SYS; goto exit; }
+ 
+@@ -205,7 +209,7 @@
+ }
+ 
+ /* Read one or more sectors */
+-int cdrom_read_sectors(void *buffer, int sector, int cnt) {
++int cdrom_read_sectors(int type, void *buffer, int sector, int cnt) {
+ 	struct {
+ 		int	sec, num;
+ 		void	*buffer;
+@@ -219,8 +223,47 @@
+ 	params.num = cnt;	/* Number of sectors */
+ 	params.buffer = buffer;	/* Output buffer */
+ 	params.dunno = 0;	/* ? */
+-	rv = cdrom_exec_cmd(CMD_PIOREAD, &params);
++	if(type == READ_PIO) {
++		rv = cdrom_exec_cmd(CMD_PIOREAD, &params);
++	} else {
++		rv = cdrom_exec_cmd(CMD_DMAREAD, &params);
++	}		
++	mutex_unlock(mutex);
++	return rv;
++}
++
++int cdrom_get_subchannel(int format, void *buffer, int buflen) {
++	struct {
++		int	format;
++		int	buflen;
++		void	*buffer;
++	} params;
++	int rv;
++
++	mutex_lock(mutex);
+ 	
++	params.format = format;
++	params.buflen = buflen;
++	params.buffer = buffer;
++
++	rv = cdrom_exec_cmd(CMD_GETSCD, &params);
++	mutex_unlock(mutex);
++	return rv;
++}
++
++int cdrom_set_datatype(int param1, int cdxa, int sector_size) {
++	uint32 params[4];
++	int rv = ERR_OK;
++
++	mutex_lock(mutex);
++	params[0] = 0; 				/* 0 = set, 1 = get */
++	params[1] = param1;			/* ? */
++	params[2] = cdxa;			/* CD-XA mode 1/2 */
++	params[3] = sector_size;		/* sector size */
++
++	if(gdc_change_data_type(params) < 0)
++          rv = ERR_SYS;
++
+ 	mutex_unlock(mutex);
+ 	return rv;
+ }
+@@ -310,7 +353,7 @@
+ }
+ 
+ /* Initialize: assume no threading issues */
+-int cdrom_init() {
++int cdrom_init(int param1, int cdxa, int sector_size) {
+ 	uint32 p, x;
+ 	volatile uint32 *react = (uint32*)0xa05f74e4,
+ 		*bios = (uint32*)0xa0000000;
+@@ -330,7 +373,7 @@
+ 	mutex = mutex_create();
+ 
+ 	/* Do an initial initialization */
+-	cdrom_reinit();
++	cdrom_reinit(param1, cdxa, sector_size);
+ 	
+ 	return 0;
+ }
+diff -ur kos.orig/kernel/arch/dreamcast/hardware/hardware.c kos/kernel/arch/dreamcast/hardware/hardware.c
+--- kos.orig/kernel/arch/dreamcast/hardware/hardware.c	2008-07-07 20:43:44.000000000 -0700
++++ kos/kernel/arch/dreamcast/hardware/hardware.c	2008-07-07 21:49:32.000000000 -0700
+@@ -36,7 +36,7 @@
+ 	spu_dma_init();
+ 
+ 	/* Init CD-ROM.. NOTE: NO GD-ROM SUPPORT. ONLY CDs/CDRs. */
+-	cdrom_init();
++	cdrom_init(-1, -1, -1);
+ 
+ 	/* Setup maple bus */
+ 	maple_init();
+diff -ur kos.orig/kernel/arch/dreamcast/include/dc/cdrom.h kos/kernel/arch/dreamcast/include/dc/cdrom.h
+--- kos.orig/kernel/arch/dreamcast/include/dc/cdrom.h	2008-07-07 20:43:42.000000000 -0700
++++ kos/kernel/arch/dreamcast/include/dc/cdrom.h	2008-07-07 21:49:32.000000000 -0700
+@@ -31,6 +31,10 @@
+ #define CMD_GETSCD	34
+ #define CMD_GETSES	35
+ 
++
++#define READ_PIO	0
++#define READ_DMA	1
++
+ /* Command responses */
+ #define ERR_OK		0
+ #define ERR_NO_DISC	1
+@@ -67,6 +71,12 @@
+ #define CD_CDI		0x30
+ #define CD_GDROM	0x80
+ 
++/* sub channel formats */
++#define CD_SUB_Q_CHANNEL        0
++#define CD_SUB_CURRENT_POSITION 1
++#define CD_SUB_MEDIA_CATALOG    2
++#define CD_SUB_TRACK_ISRC       3
++
+ /* TOC structure returned by the BIOS */
+ typedef struct {
+ 	uint32	entry[99];
+@@ -90,13 +100,19 @@
+ int cdrom_get_status(int *status, int *disc_type);
+ 
+ /* Re-init the drive, e.g., after a disc change, etc */
+-int cdrom_reinit();
++int cdrom_reinit(int param1, int cdxa, int sector_size);
+ 
+ /* Read the table of contents */
+ int cdrom_read_toc(CDROM_TOC *toc_buffer, int session);
+ 
+ /* Read one or more sectors */
+-int cdrom_read_sectors(void *buffer, int sector, int cnt);
++int cdrom_read_sectors(int type, void *buffer, int sector, int cnt);
++
++/* Get subchannel data from last read sector */
++int cdrom_get_subchannel(int format, void *buffer, int buflen);
++
++/* Set data type of cdrom sector reads */
++int cdrom_set_datatype(int param1, int cdxa, int sector_size);
+ 
+ /* Locate the LBA sector of the data track */
+ uint32 cdrom_locate_data_track(CDROM_TOC *toc);
+@@ -114,7 +130,7 @@
+ int cdrom_spin_down();
+ 
+ /* Initialize */
+-int cdrom_init();
++int cdrom_init(int param1, int cdxa, int sector_size);
+ void cdrom_shutdown();
+ 
+ __END_DECLS
+diff -ur kos.orig/kernel/libc/koslib/realpath.c kos/kernel/libc/koslib/realpath.c
+--- kos.orig/kernel/libc/koslib/realpath.c	2008-07-07 20:43:41.000000000 -0700
++++ kos/kernel/libc/koslib/realpath.c	2008-07-07 21:49:32.000000000 -0700
+@@ -53,6 +53,9 @@
+ 	int serrno;
+ 	char left[PATH_MAX], next_token[PATH_MAX];
+ 
++        strcpy(resolved, path);
++        return resolved;
++
+ 	serrno = errno;
+ 	if (path[0] == '/') {
+ 		resolved[0] = '/';
+ 
